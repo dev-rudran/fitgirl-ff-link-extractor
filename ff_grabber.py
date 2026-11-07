@@ -1,13 +1,17 @@
 import setuptools  # Register distutils fallback
-import os
+import argparse
 import base64
 import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
 import zlib
 import tkinter as tk
 from tkinter import ttk, messagebox
-import threading
-import time
-import re
 import requests
 import base58
 from bs4 import BeautifulSoup
@@ -97,8 +101,353 @@ def decrypt_privatebin_paste(paste_url):
     return payload.get("paste", "")
 
 
+# ---------------------------------------------------------------------------
+# Browser discovery and selection (Chromium-based browsers only, for now)
+#
+# Any Chromium browser you can launch from a terminal works on Linux, e.g.
+#     python ff_grabber.py --browser chromium
+#     python ff_grabber.py --browser helium-browser
+#     python ff_grabber.py --browser brave-browser
+# A full path also works. Known browsers are auto-detected for the GUI list.
+# ---------------------------------------------------------------------------
+
+CHROMIUM = "chromium"
+FIREFOX = "firefox"
+EDGE = "edge"
+
+# Ordered roughly by how well each engine gets through Cloudflare Turnstile.
+BROWSER_SPECS = [
+    {
+        "key": "chrome",
+        "label": "Google Chrome",
+        "engine": CHROMIUM,
+        "commands": ("google-chrome", "google-chrome-stable", "chrome"),
+        "windows": (
+            r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
+            r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
+            r"%LocalAppData%\Google\Chrome\Application\chrome.exe",
+        ),
+        "macos": ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",),
+        "linux": (
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/opt/google/chrome/chrome",
+        ),
+        "flatpak": ("com.google.Chrome",),
+    },
+    {
+        "key": "brave",
+        "label": "Brave",
+        "engine": CHROMIUM,
+        "commands": ("brave-browser", "brave"),
+        "windows": (
+            r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe",
+            r"%ProgramFiles(x86)%\BraveSoftware\Brave-Browser\Application\brave.exe",
+            r"%LocalAppData%\BraveSoftware\Brave-Browser\Application\brave.exe",
+        ),
+        "macos": ("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",),
+        "linux": (
+            "/usr/bin/brave-browser",
+            "/usr/bin/brave",
+            "/opt/brave.com/brave/brave",
+        ),
+        "flatpak": ("com.brave.Browser",),
+    },
+    {
+        "key": "chromium",
+        "label": "Chromium",
+        "engine": CHROMIUM,
+        "commands": ("chromium", "chromium-browser", "chromium-freeworld"),
+        "windows": (
+            r"%ProgramFiles%\Chromium\Application\chrome.exe",
+            r"%LocalAppData%\Chromium\Application\chrome.exe",
+        ),
+        "macos": ("/Applications/Chromium.app/Contents/MacOS/Chromium",),
+        "linux": (
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/lib/chromium/chromium",
+            "/snap/bin/chromium",
+        ),
+        "flatpak": ("org.chromium.Chromium",),
+    },
+    {
+        "key": "helium",
+        "label": "Helium",
+        "engine": CHROMIUM,
+        "commands": ("helium-browser", "helium"),
+        "windows": (
+            r"%ProgramFiles%\Helium\Application\helium.exe",
+            r"%ProgramFiles%\Helium\Application\chrome.exe",
+            r"%LocalAppData%\Helium\Application\helium.exe",
+            r"%LocalAppData%\Helium\Application\chrome.exe",
+        ),
+        "macos": ("/Applications/Helium.app/Contents/MacOS/Helium",),
+        "linux": (
+            "/usr/bin/helium-browser",
+            "/usr/bin/helium",
+            "/opt/helium-browser-bin/helium",
+            "/opt/helium/helium",
+        ),
+        "flatpak": (),
+    },
+    {
+        "key": "vivaldi",
+        "label": "Vivaldi",
+        "engine": CHROMIUM,
+        "commands": ("vivaldi", "vivaldi-stable"),
+        "windows": (
+            r"%LocalAppData%\Vivaldi\Application\vivaldi.exe",
+            r"%ProgramFiles%\Vivaldi\Application\vivaldi.exe",
+        ),
+        "macos": ("/Applications/Vivaldi.app/Contents/MacOS/Vivaldi",),
+        "linux": (
+            "/usr/bin/vivaldi",
+            "/usr/bin/vivaldi-stable",
+            "/opt/vivaldi/vivaldi",
+        ),
+        "flatpak": ("com.vivaldi.Vivaldi",),
+    },
+    {
+        "key": "opera",
+        "label": "Opera",
+        "engine": CHROMIUM,
+        "commands": ("opera", "opera-stable"),
+        "windows": (
+            r"%LocalAppData%\Programs\Opera\opera.exe",
+            r"%ProgramFiles%\Opera\opera.exe",
+        ),
+        "macos": ("/Applications/Opera.app/Contents/MacOS/Opera",),
+        "linux": (
+            "/usr/bin/opera",
+            "/usr/lib/x86_64-linux-gnu/opera/opera",
+            "/opt/opera/opera",
+        ),
+        "flatpak": ("com.opera.Opera",),
+    },
+]
+
+
+class BrowserNotFound(Exception):
+    def __init__(self, value):
+        self.value = value
+        super().__init__(value)
+
+
+class BrowserUnsupported(Exception):
+    def __init__(self, value, label=None, engine=None):
+        self.value = value
+        self.label = label or value
+        self.engine = engine
+        super().__init__(value)
+
+
+def _current_os():
+    if sys.platform.startswith("win"):
+        return "windows"
+    if sys.platform == "darwin":
+        return "macos"
+    return "linux"
+
+
+def _normalize(value):
+    """Normalize a browser name/path so 'Google Chrome', 'google chrome' and 'google-chrome' match."""
+    name = os.path.basename((value or "").strip()).lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return re.sub(r"[\s_]+", "-", name)
+
+
+def _expand_path(path):
+    return os.path.expanduser(os.path.expandvars(path))
+
+
+def _is_executable(path):
+    path = _expand_path(path)
+    return path if os.path.isfile(path) and os.access(path, os.X_OK) else None
+
+
+def _flatpak_export_dirs():
+    xdg_data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return (
+        "/var/lib/flatpak/exports/bin",
+        os.path.join(xdg_data, "flatpak/exports/bin"),
+    )
+
+
+def _find_spec_executable(spec):
+    """Locate a known browser: PATH command first, then OS paths, then Flatpak exports."""
+    for command in spec.get("commands", ()):
+        found = shutil.which(command)
+        if found:
+            return found
+
+    for path in spec.get(_current_os(), ()):
+        found = _is_executable(path)
+        if found:
+            return found
+
+    for app_id in spec.get("flatpak", ()):
+        found = shutil.which(app_id)
+        if found:
+            return found
+        for export_dir in _flatpak_export_dirs():
+            found = _is_executable(os.path.join(export_dir, app_id))
+            if found:
+                return found
+
+    return None
+
+
+def detect_browsers():
+    """Return every known browser installed on this machine, in preference order."""
+    found = []
+    seen_paths = set()
+    for spec in BROWSER_SPECS:
+        path = _find_spec_executable(spec)
+        if not path:
+            continue
+        real_path = os.path.realpath(path)
+        if real_path in seen_paths:
+            continue
+        seen_paths.add(real_path)
+        found.append({
+            "key": spec["key"],
+            "label": spec["label"],
+            "engine": spec["engine"],
+            "path": path,
+        })
+    return found
+
+
+# Aliases such as "Google Chrome", "google-chrome-stable" and "chrome" all map to a spec.
+_BROWSER_ALIASES = {}
+for _spec in BROWSER_SPECS:
+    for _alias in (_spec["key"], _spec["label"], *_spec["commands"]):
+        _BROWSER_ALIASES[_normalize(_alias)] = _spec
+del _spec, _alias
+
+
+def infer_browser_engine(path):
+    """Infer the automation engine from an executable name, falling back to --version."""
+    name = _normalize(path)
+
+    if any(marker in name for marker in ("firefox", "zen", "librewolf", "waterfox", "floorp", "tor-browser")):
+        return FIREFOX
+    if "msedge" in name or "microsoft-edge" in name or name == "edge":
+        return EDGE
+    if any(marker in name for marker in ("chrome", "chromium", "brave", "vivaldi", "opera", "helium")):
+        return CHROMIUM
+
+    try:
+        result = subprocess.run(
+            [path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        version_text = (result.stdout + result.stderr).lower()
+        if any(marker in version_text for marker in ("firefox", "zen", "librewolf", "waterfox", "floorp", "mozilla")):
+            return FIREFOX
+        if "edge" in version_text:
+            return EDGE
+    except Exception:
+        pass
+
+    # Unknown executable: the Chromium driver is the safer default.
+    return CHROMIUM
+
+
+def browser_major_version(path):
+    """Read the Chromium major version so undetected-chromedriver fetches the right driver."""
+    try:
+        result = subprocess.run(
+            [path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        version_text = result.stdout + result.stderr
+        match = re.search(r"(?:chromium|chrome)[^0-9]{0,10}(\d+)\.", version_text, re.IGNORECASE)
+        if not match:
+            match = re.search(r"(\d+)\.\d+\.\d+", version_text)
+        return int(match.group(1)) if match else None
+    except Exception:
+        return None
+
+
+def resolve_browser(value, detected=None):
+    """
+    Resolve --browser into {key, label, engine, path}.
+
+    Accepts anything the user could type in a terminal: a command name
+    (chromium, helium-browser, brave-browser), a friendly alias (chrome, brave),
+    or an absolute path. Returns None for "auto".
+    """
+    value = (value or "").strip()
+    if not value or _normalize(value) in ("auto", "auto-detect", "auto-detect-browser"):
+        return None
+
+    path = None
+    expanded = _expand_path(value)
+    if os.path.isfile(expanded):
+        path = expanded
+    if not path:
+        path = shutil.which(value)
+
+    spec = _BROWSER_ALIASES.get(_normalize(value))
+
+    if not path and spec:
+        path = _find_spec_executable(spec)
+
+    if not path and detected:
+        for browser in detected:
+            if _normalize(browser["label"]) == _normalize(value):
+                return browser
+
+    if not path:
+        raise BrowserNotFound(value)
+
+    # A command name or path may still match a known spec (e.g. /usr/bin/chromium).
+    if spec is None:
+        spec = _BROWSER_ALIASES.get(_normalize(path))
+
+    if spec:
+        label = spec["label"]
+        engine = spec["engine"]
+        key = spec["key"]
+    else:
+        label = os.path.basename(path)
+        engine = infer_browser_engine(path)
+        key = _normalize(label)
+
+    if engine != CHROMIUM:
+        raise BrowserUnsupported(value, label, engine)
+
+    return {"key": key, "label": label, "engine": engine, "path": path}
+
+
+def format_browser_list(browsers=None):
+    browsers = detect_browsers() if browsers is None else browsers
+    if not browsers:
+        return (
+            "No known Chromium-based browsers were detected.\n"
+            "Install one, or pass --browser with any command that works in your terminal\n"
+            "(e.g. --browser chromium) or a full path."
+        )
+
+    lines = ["Detected Chromium-based browsers (Auto-Detect uses the first one):"]
+    for browser in browsers:
+        lines.append(
+            f"  {browser['label']:<20} {browser['engine']:<9} {browser['path']}"
+        )
+    lines.append("")
+    lines.append("Use any of these with --browser, the command name, or a full path.")
+    return "\n".join(lines)
+
+
 class FitgirlExtractorApp:
-    def __init__(self, root):
+    def __init__(self, root, preferred_browser=None):
         self.root = root
         self.root.title("FitGirl FF Link Extractor (Pro)")
         self.root.geometry("700x750")
@@ -108,6 +457,11 @@ class FitgirlExtractorApp:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(2, weight=1) # Checklist area
         self.root.rowconfigure(5, weight=1) # Output area
+
+        self.browsers = detect_browsers()
+        self.preferred_label = None
+        if preferred_browser:
+            self.preferred_label = self._add_browser(preferred_browser)
 
         self.checkbox_vars = {}  # Store {url: BooleanVar}
         self.checkbox_list = []
@@ -136,6 +490,21 @@ class FitgirlExtractorApp:
         self.root.bind_all("<Button-4>", self._on_mousewheel) 
         self.root.bind_all("<Button-5>", self._on_mousewheel)
         self.root.bind_all("<ButtonRelease-1>", self._on_mouse_release)
+
+    def _add_browser(self, browser):
+        """Add a browser chosen on the command line to the dropdown and return its label."""
+        real_path = os.path.realpath(browser["path"])
+        for existing in self.browsers:
+            if os.path.realpath(existing["path"]) == real_path:
+                return existing["label"]
+
+        label = browser["label"]
+        if any(existing["label"] == label for existing in self.browsers):
+            label = f"{label} ({os.path.basename(browser['path'])})"
+            browser = dict(browser, label=label)
+
+        self.browsers.insert(0, browser)
+        return label
 
     def setup_ui(self):
         # 1. Input Frame
@@ -198,14 +567,17 @@ class FitgirlExtractorApp:
         self.extract_btn = ttk.Button(controls_frame, text="2. Extract Selected", command=self.start_extraction_thread, state="disabled")
         self.extract_btn.pack(side="right", padx=2)
         self.browser_var = tk.StringVar(value="Auto-Detect Browser")
-        self.browser_combo = ttk.Combobox(controls_frame, textvariable=self.browser_var, state="readonly", width=18)
+        self.browser_combo = ttk.Combobox(controls_frame, textvariable=self.browser_var, state="readonly", width=22)
         self.browser_combo['values'] = (
-            "Auto-Detect Browser", 
-            "Google Chrome", 
-            "Microsoft Edge", 
-            "Brave", 
-            "Mozilla Firefox"
+            ["Auto-Detect Browser"] + [browser["label"] for browser in self.browsers]
         )
+        if self.preferred_label:
+            self.browser_var.set(self.preferred_label)
+        elif not self.browsers:
+            self.browser_var.set("Auto-Detect Browser")
+            self.status_var.set(
+                "No supported browser found. Install one or launch with --browser NAME (see --list-browsers)."
+            )
         self.browser_combo.pack(side="right", padx=(5, 10))
 
         # 4. Progress Bar
@@ -523,51 +895,13 @@ class FitgirlExtractorApp:
         self.extract_btn.config(state="normal")
 
     # --- Step 2: Extraction ---
-    def get_browser_path(self, selected_browser="Auto-Detect Browser"):
-        browser_paths = {
-            "Google Chrome": [
-                r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
-                r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
-                r"%LocalAppData%\Google\Chrome\Application\chrome.exe",
-                "/usr/bin/google-chrome",
-                "/usr/bin/google-chrome-stable",
-                "/var/lib/flatpak/exports/bin/com.google.Chrome"
-            ],
-            "Microsoft Edge": [
-                r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
-                r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe",
-                r"%LocalAppData%\Microsoft\Edge\Application\msedge.exe",
-                "/usr/bin/microsoft-edge-stable",
-                "/usr/bin/microsoft-edge"
-            ],
-            "Brave": [
-                r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe",
-                r"%ProgramFiles(x86)%\BraveSoftware\Brave-Browser\Application\brave.exe",
-                r"%LocalAppData%\BraveSoftware\Brave-Browser\Application\brave.exe",
-                "/usr/bin/brave-browser",
-                "/usr/bin/brave",
-                "/var/lib/flatpak/exports/bin/com.brave.Browser"
-            ],
-            "Mozilla Firefox": [
-                r"%ProgramFiles%\Mozilla Firefox\firefox.exe",
-                r"%ProgramFiles(x86)%\Mozilla Firefox\firefox.exe",
-                r"%LocalAppData%\Mozilla Firefox\firefox.exe",
-                "/usr/bin/firefox",
-                "/var/lib/flatpak/exports/bin/org.mozilla.firefox"
-            ]
-        }
-        
-        if selected_browser != "Auto-Detect Browser":
-            paths_to_check = browser_paths.get(selected_browser, [])
-        else:
-            paths_to_check = []
-            for paths in browser_paths.values():
-                paths_to_check.extend(paths)
-
-        for path in paths_to_check:
-            expanded_path = os.path.expandvars(path)
-            if os.path.exists(expanded_path):
-                return expanded_path
+    def get_selected_browser(self):
+        selected_label = self.browser_var.get()
+        if selected_label == "Auto-Detect Browser" or not selected_label:
+            return self.browsers[0] if self.browsers else None
+        for browser in self.browsers:
+            if browser["label"] == selected_label:
+                return browser
         return None
 
     def start_extraction_thread(self):
@@ -588,45 +922,33 @@ class FitgirlExtractorApp:
         driver = None
         total = len(links)
         
-        selected_browser = self.browser_var.get()
-        browser_executable = self.get_browser_path(selected_browser)
-        if not browser_executable:
-            self.root.after(0, self.update_ui, f"Error: Could not find {selected_browser} on your system.")
+        browser = self.get_selected_browser()
+        if not browser:
+            self.root.after(0, self.update_ui,
+                "Error: no supported browser found. Install a browser or launch with "
+                "--browser NAME (run with --list-browsers to see what is installed).")
             self.root.after(0, lambda: self.fetch_btn.config(state="normal"))
             self.root.after(0, lambda: self.extract_btn.config(state="normal"))
             return
 
-        browser_name = os.path.basename(browser_executable).replace('.exe', '')
-        print(f"EXTRACTION START: {total} links, browser={selected_browser} -> {browser_executable}")
+        browser_executable = browser["path"]
+        browser_engine = browser["engine"]
+        browser_name = browser["label"]
+        print(f"EXTRACTION START: {total} links, browser={browser_name} ({browser_engine}) -> {browser_executable}")
         self.root.after(0, self.update_ui, f"Initializing using {browser_name} to bypass Cloudflare...", 0, total)
         
         def create_driver(version=None):
-            if browser_name.lower() == 'firefox':
-                from selenium import webdriver
-                from selenium.webdriver.firefox.options import Options
-                opts = Options()
-                opts.binary_location = browser_executable
-                opts.set_preference("dom.webdriver.enabled", False)
-                return webdriver.Firefox(options=opts)
-                
-            elif browser_name.lower() == 'msedge':
-                from selenium import webdriver
-                from selenium.webdriver.edge.options import Options
-                opts = Options()
-                opts.binary_location = browser_executable
-                opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-                opts.add_experimental_option('useAutomationExtension', False)
-                opts.add_argument("--disable-blink-features=AutomationControlled")
-                return webdriver.Edge(options=opts)
-                
-            else:
-                opts = uc.ChromeOptions()
-                return uc.Chrome(
-                    options=opts, 
-                    use_subprocess=True, 
-                    browser_executable_path=browser_executable, 
-                    version_main=version
-                )
+            opts = uc.ChromeOptions()
+            opts.add_argument("--no-first-run")
+            opts.add_argument("--no-default-browser-check")
+            if not version:
+                version = browser_major_version(browser_executable)
+            return uc.Chrome(
+                options=opts,
+                use_subprocess=True,
+                browser_executable_path=browser_executable,
+                version_main=version
+            )
         
         def ensure_window(drv):
             handles = drv.window_handles
@@ -664,7 +986,7 @@ class FitgirlExtractorApp:
             except Exception as e:
                 print(f"DRIVER CREATE ERROR ({browser_name}): {e}")
                 error_msg = str(e)
-                if browser_name.lower() not in ['firefox', 'msedge'] and "Current browser version is" in error_msg:
+                if browser_engine == CHROMIUM and "Current browser version is" in error_msg:
                     match = re.search(r"Current browser version is (\d+)", error_msg)
                     if match:
                         correct_version = int(match.group(1))
@@ -676,26 +998,14 @@ class FitgirlExtractorApp:
                 else:
                     raise e
 
-            detectable_browser = browser_name.lower() in ('firefox', 'msedge')
-            captcha_blocked = 0
-            resolved_any = False
-            if detectable_browser:
-                self.root.after(0, self.update_ui,
-                    f"Warning: Cloudflare can detect automation in {browser_name} and may refuse the captcha. "
-                    f"Google Chrome or Brave is recommended.")
-
             def extract_one(drv, link, filename):
-                nonlocal captcha_blocked
                 ensure_window(drv)
                 drv.get(link)
 
-                last_html = ""
-                last_token = None
                 clicked_widget = False
                 for tick in range(60):
                     time.sleep(1)
                     page_html = drv.page_source
-                    last_html = page_html
 
                     match_old = re.search(r'window\.open\("([^"]+)"\)', page_html)
                     if match_old:
@@ -707,7 +1017,6 @@ class FitgirlExtractorApp:
                             "return window.turnstileToken"
                             " || (document.querySelector('[name=\"cf-turnstile-response\"]') || {}).value"
                             " || null;")
-                        last_token = turnstile_token
                         if not turnstile_token:
                             if 'data-sitekey' in page_html:
                                 if not clicked_widget and tick >= 2:
@@ -760,9 +1069,6 @@ class FitgirlExtractorApp:
                         except Exception:
                             pass
 
-                is_cf_challenge = ("Just a moment" in last_html) or ("challenges.cloudflare.com" in last_html)
-                if is_cf_challenge and not last_token:
-                    captcha_blocked += 1
                 return None
 
             for i, link in enumerate(links, 1):
@@ -773,7 +1079,6 @@ class FitgirlExtractorApp:
                     try:
                         direct_url = extract_one(driver, link, filename)
                         if direct_url:
-                            resolved_any = True
                             self.root.after(0, self.update_ui, None, i, None, direct_url)
                         else:
                             self.root.after(0, self.update_ui, None, i, None, f"# FAILED: {filename} ({link})")
@@ -789,15 +1094,6 @@ class FitgirlExtractorApp:
                             continue
                         self.root.after(0, self.update_ui, None, i, None, f"# ERROR: {str(e)} -> {filename}")
                         break
-
-                if detectable_browser and captcha_blocked >= 2 and not resolved_any:
-                    self.root.after(0, self.update_ui,
-                        f"Cloudflare is rejecting {browser_name}: the captcha never completes for an automated "
-                        f"{browser_name} window. Use Google Chrome or Brave instead.")
-                    self.root.after(0, self.update_ui, None, None, None,
-                        f"# STOPPED after {i} links: Cloudflare would not verify {browser_name}. "
-                        f"Re-run with Google Chrome or Brave.")
-                    break
             else:
                 self.root.after(0, self.update_ui, f"Extraction complete! Processed {total} links.")
             
@@ -814,11 +1110,77 @@ class FitgirlExtractorApp:
                 except:
                     pass
 
-if __name__ == "__main__":
-    root = tk.Tk()
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="ff_grabber.py",
+        description=(
+            "Fetch fuckingfast links from FitGirl pages/pastes and resolve direct download URLs. "
+            "The GUI opens with the chosen browser preselected."
+        ),
+    )
+    parser.add_argument(
+        "-b", "--browser",
+        metavar="NAME|PATH",
+        help=(
+            "Chromium-based browser to use. Accepts anything that works in your terminal "
+            "(chromium, helium-browser, brave-browser, google-chrome, vivaldi, opera) "
+            "or a full path. Default: auto-detect."
+        ),
+    )
+    parser.add_argument(
+        "--list-browsers",
+        action="store_true",
+        help="List detected browsers and exit.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    detected = detect_browsers()
+    if args.list_browsers:
+        print(format_browser_list(detected))
+        return 0
+
+    preferred_browser = None
+    if args.browser:
+        try:
+            preferred_browser = resolve_browser(args.browser, detected)
+        except BrowserNotFound:
+            print(f"error: browser '{args.browser}' was not found.", file=sys.stderr)
+            print(
+                "Pass a command that works in your terminal "
+                "(e.g. --browser chromium), a full path, or one of these:\n",
+                file=sys.stderr,
+            )
+            print(format_browser_list(detected), file=sys.stderr)
+            return 2
+        except BrowserUnsupported as e:
+            print(
+                f"error: {e.label} is not supported yet. "
+                "Only Chromium-based browsers are supported right now "
+                "(Chrome, Brave, Chromium, Helium, Vivaldi, Opera).",
+                file=sys.stderr,
+            )
+            print("", file=sys.stderr)
+            print(format_browser_list(detected), file=sys.stderr)
+            return 2
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as e:
+        print(f"error: could not open the GUI ({e}). This tool needs a desktop session.", file=sys.stderr)
+        return 1
+
     style = ttk.Style(root)
     if "clam" in style.theme_names():
         style.theme_use("clam")
-        
-    app = FitgirlExtractorApp(root)
+
+    app = FitgirlExtractorApp(root, preferred_browser=preferred_browser)
     root.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
