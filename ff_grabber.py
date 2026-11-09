@@ -12,6 +12,7 @@ import time
 import zlib
 import tkinter as tk
 from tkinter import ttk, messagebox
+from urllib.parse import urlparse
 import requests
 import base58
 from bs4 import BeautifulSoup
@@ -30,6 +31,38 @@ PASTE_URL_RE = re.compile(
     r"https?://paste\.fitgirl-repacks\.site/\?[0-9a-fA-F]+#[A-Za-z0-9]+",
     re.IGNORECASE,
 )
+
+
+def clean_game_name(title):
+    """Turn a FitGirl page title into a plain game name."""
+    if not title:
+        return None
+    title = re.sub(r"\s+", " ", title).strip()
+    title = re.sub(r"\s*[-–—|:]\s*FitGirl\s+Repacks.*$", "", title, flags=re.IGNORECASE)
+    title = title.strip(" -–—|:")
+    return title or None
+
+
+def game_name_from_url(url):
+    """Fallback game name from a FitGirl page slug, e.g. /grand-theft-auto-v/."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    host = (parsed.hostname or "").lower()
+    if host == "fitgirl-repacks.site" or host.endswith(".fitgirl-repacks.site"):
+        parts = [part for part in parsed.path.split("/") if part]
+        if parts:
+            return parts[0].replace("-", " ").strip()
+    return None
+
+
+def sanitize_filename(name):
+    """Make a game name safe to use as a cross-platform filename."""
+    name = re.sub(r"[/\\]", "-", name or "")
+    name = re.sub(r'[<>:"|?*\x00-\x1f]', "", name)
+    name = re.sub(r"\s+", " ", name).strip(" .-")
+    return name[:120].strip(" .-") or "fuckingfast_links"
 
 
 def extract_ff_links(text):
@@ -447,7 +480,7 @@ def format_browser_list(browsers=None):
 
 
 class FitgirlExtractorApp:
-    def __init__(self, root, preferred_browser=None):
+    def __init__(self, root, preferred_browser=None, save_by_default=False):
         self.root = root
         self.root.title("FitGirl FF Link Extractor (Pro)")
         self.root.geometry("700x750")
@@ -462,6 +495,9 @@ class FitgirlExtractorApp:
         self.preferred_label = None
         if preferred_browser:
             self.preferred_label = self._add_browser(preferred_browser)
+
+        self.save_by_default = save_by_default
+        self.game_name = None
 
         self.checkbox_vars = {}  # Store {url: BooleanVar}
         self.checkbox_list = []
@@ -616,6 +652,14 @@ class FitgirlExtractorApp:
         self.clear_btn = ttk.Button(btn_frame, text="Clear Output", command=self.clear_output)
         self.clear_btn.pack(side="right", padx=10)
 
+        self.save_var = tk.BooleanVar(value=self.save_by_default)
+        self.save_check = ttk.Checkbutton(
+            btn_frame,
+            text="Auto-save links to <game name>.txt",
+            variable=self.save_var,
+        )
+        self.save_check.pack(side="left")
+
     # --- Mousewheel & Multi-Select Logic ---
 
     def _on_mousewheel(self, event):
@@ -756,6 +800,20 @@ class FitgirlExtractorApp:
         self.text_area.delete(1.0, tk.END)
         self.progress.config(value=0)
 
+    def save_links_to_file(self, links, game_name=None):
+        """Write resolved links to <game name>.txt in the current directory."""
+        if not links:
+            return None
+        filename = sanitize_filename(game_name or self.game_name) + ".txt"
+        path = os.path.join(os.getcwd(), filename)
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(links) + "\n")
+        except OSError as e:
+            print(f"SAVE ERROR: {e}")
+            return None
+        return path
+
     def update_ui(self, status=None, progress_val=None, max_val=None, text_append=None):
         if status is not None:
             self.status_var.set(status)
@@ -788,6 +846,7 @@ class FitgirlExtractorApp:
         self.checkbox_list.clear()
         self.widget_to_index.clear()
         self.last_clicked_idx = None
+        self.game_name = None
 
         thread = threading.Thread(target=self.run_fetch, args=(raw,), daemon=True)
         thread.start()
@@ -815,6 +874,12 @@ class FitgirlExtractorApp:
                     links.append(link)
         return links
 
+    def _game_name_from_html(self, html):
+        soup = BeautifulSoup(html, "html.parser")
+        if soup.title and soup.title.string:
+            return clean_game_name(soup.title.string)
+        return None
+
     def run_fetch(self, raw):
         try:
             ff_links = []
@@ -825,6 +890,9 @@ class FitgirlExtractorApp:
                 and first_line.lower().startswith("http")
                 and "<" not in first_line
             )
+
+            if is_single_http_url:
+                self.game_name = game_name_from_url(first_line)
 
             # A) PrivateBin paste URL(s) — decrypt client-side AES paste
             paste_urls = PASTE_URL_RE.findall(raw)
@@ -843,10 +911,16 @@ class FitgirlExtractorApp:
                 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
                 res = requests.get(first_line, headers=headers, timeout=20)
                 res.raise_for_status()
+                self.game_name = (
+                    self._game_name_from_html(res.text)
+                    or game_name_from_url(first_line)
+                )
                 ff_links = self._links_from_page_html(res.text)
 
             # C) Pasted HTML (<a href="https://fuckingfast.co/...">), markdown, or raw FF URLs
             if not ff_links:
+                if not self.game_name and "<" in raw:
+                    self.game_name = self._game_name_from_html(raw)
                 ff_links = extract_ff_links(raw)
 
             self.root.after(0, self.populate_checkboxes, ff_links)
@@ -915,12 +989,17 @@ class FitgirlExtractorApp:
         self.extract_btn.config(state="disabled")
         self.clear_output()
 
-        thread = threading.Thread(target=self.run_extraction, args=(selected_links,), daemon=True)
+        thread = threading.Thread(
+            target=self.run_extraction,
+            args=(selected_links, self.save_var.get(), self.game_name),
+            daemon=True,
+        )
         thread.start()
 
-    def run_extraction(self, links):
+    def run_extraction(self, links, save_links=False, game_name=None):
         driver = None
         total = len(links)
+        resolved_links = []
         
         browser = self.get_selected_browser()
         if not browser:
@@ -1079,6 +1158,7 @@ class FitgirlExtractorApp:
                     try:
                         direct_url = extract_one(driver, link, filename)
                         if direct_url:
+                            resolved_links.append(direct_url)
                             self.root.after(0, self.update_ui, None, i, None, direct_url)
                         else:
                             self.root.after(0, self.update_ui, None, i, None, f"# FAILED: {filename} ({link})")
@@ -1095,7 +1175,17 @@ class FitgirlExtractorApp:
                         self.root.after(0, self.update_ui, None, i, None, f"# ERROR: {str(e)} -> {filename}")
                         break
             else:
-                self.root.after(0, self.update_ui, f"Extraction complete! Processed {total} links.")
+                if not save_links:
+                    message = f"Extraction complete! Processed {total} links."
+                elif not resolved_links:
+                    message = "Extraction complete! No direct links resolved, so nothing was saved."
+                else:
+                    saved_path = self.save_links_to_file(resolved_links, game_name)
+                    if saved_path:
+                        message = f"Extraction complete! Saved {len(resolved_links)} link(s) to {saved_path}"
+                    else:
+                        message = "Extraction complete, but the .txt file could not be written."
+                self.root.after(0, self.update_ui, message)
             
         except Exception as e:
             print(f"CRITICAL ERROR: {e}")
@@ -1131,6 +1221,11 @@ def parse_args(argv=None):
         "--list-browsers",
         action="store_true",
         help="List detected browsers and exit.",
+    )
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        help="Automatically save resolved links to '<game name>.txt' in the current directory.",
     )
     return parser.parse_args(argv)
 
@@ -1177,7 +1272,11 @@ def main(argv=None):
     if "clam" in style.theme_names():
         style.theme_use("clam")
 
-    app = FitgirlExtractorApp(root, preferred_browser=preferred_browser)
+    app = FitgirlExtractorApp(
+        root,
+        preferred_browser=preferred_browser,
+        save_by_default=args.save,
+    )
     root.mainloop()
     return 0
 

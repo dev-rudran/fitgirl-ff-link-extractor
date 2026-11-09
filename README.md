@@ -29,7 +29,10 @@ pip install -r requirements.txt
 
 python ff_grabber.py --list-browsers     # show detected browsers
 python ff_grabber.py --browser chromium
+python ff_grabber.py --browser chromium --save   # also save <game name>.txt
 ```
+
+`--save` writes the resolved direct links to `<game name>.txt` in the current directory (game name taken from the FitGirl page). You can also tick **Auto-save links to &lt;game name&gt;.txt** in the GUI.
 
 `--browser` accepts any command you can run in your terminal, or a full path:
 
@@ -51,6 +54,7 @@ The chosen browser is preselected in the GUI dropdown.
 - **Selective Scrape:** Use checkboxes to exclude unwanted files (like bonus content, other languages, etc.) before running the slow browser extraction process.
 - **Cloudflare Bypass:** Employs an undetected Chromium browser process to seamlessly pass Turnstile checks.
 - **Browser choice:** Auto-detects installed Chromium browsers, or pick one up front with `--browser`.
+- **Auto-save:** Writes resolved links to `<game name>.txt` with `--save` or the GUI checkbox.
 - **Copy-to-Clipboard:** One button copies all successfully resolved direct URLs for direct import into JDownloader 2, IDM, or Free Download Manager.
 
 ## Download (Windows Executable)
